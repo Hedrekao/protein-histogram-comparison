@@ -4,7 +4,7 @@ This project downloads protein structures from the RCSB PDB, extracts C-alpha at
 
 ## What it produces
 
-- A 3D visualization for each selected protein chain
+- A 3D visualization for each selected protein chain using a PyMOL-like secondary-structure cartoon
 - A histogram figure of the C-alpha distance distributions
 - A small HTML report with the comparison metrics
 

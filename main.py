@@ -12,33 +12,24 @@ from urllib.request import urlopen
 import matplotlib.pyplot as plt
 import numpy as np
 import py3Dmol
-from Bio.PDB import MMCIFParser, PDBIO, PDBParser, Select
+from Bio.PDB import PDBParser
 from Bio.PDB.Polypeptide import is_aa
 
 
-RCSB_PDB_URL = "https://files.rcsb.org/download/{pdb_id}.{ext}"
+RCSB_PDB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
 
 
 @dataclass
 class ProteinData:
     pdb_id: str
+    protein_name: str
     chain_id: str
     residue_count: int
     ca_coords: np.ndarray
     structure_text: str
-    format_name: str
 
-
-def parse_protein_ref(reference: str) -> tuple[str, str | None]:
-    if ":" in reference:
-        pdb_id, chain_id = reference.split(":", 1)
-        chain_id = chain_id.strip() or None
-    else:
-        pdb_id, chain_id = reference, None
-    pdb_id = pdb_id.strip().upper()
-    if len(pdb_id) != 4:
-        raise ValueError(f"Expected a 4-character PDB id, got {reference!r}")
-    return pdb_id, chain_id
+    def get_display_name(self) -> str:
+        return f"{self.pdb_id}:{self.chain_id} ({self.protein_name})"
 
 
 def fetch_structure_text(pdb_id: str) -> tuple[str, str]:
@@ -52,38 +43,18 @@ def fetch_structure_text(pdb_id: str) -> tuple[str, str]:
     raise RuntimeError(f"Could not download structure for {pdb_id}")
 
 
-def load_structure(pdb_id: str, text: str, format_name: str):
-    handle = io.StringIO(text)
-    if format_name == "PDB":
-        parser = PDBParser(QUIET=True)
-    else:
-        parser = MMCIFParser(QUIET=True)
-    return parser.get_structure(pdb_id, handle)
-
-
+# Count number of C-alpha atoms in residues of a chain that are recognized as amino acids
 def count_ca_atoms(chain) -> int:
     return sum(
         1 for residue in chain if is_aa(residue, standard=False) and "CA" in residue
     )
 
 
-def choose_chain(structure, preferred_chain_id: str | None = None):
+# If a structure has multiple chains, we select the one with the most C-alpha atoms.
+def choose_protein_chain(structure):
     chains = list(structure.get_chains())
     if not chains:
         raise RuntimeError("No chains found in structure")
-
-    if preferred_chain_id is not None:
-        for chain in chains:
-            if chain.id == preferred_chain_id:
-                if count_ca_atoms(chain) == 0:
-                    raise RuntimeError(
-                        f"Chain {preferred_chain_id!r} does not contain any C-alpha atoms"
-                    )
-                return chain
-        available = ", ".join(chain.id for chain in chains)
-        raise RuntimeError(
-            f"Chain {preferred_chain_id!r} not found. Available chains: {available}"
-        )
 
     ranked = sorted(chains, key=count_ca_atoms, reverse=True)
     selected = ranked[0]
@@ -105,47 +76,31 @@ def extract_ca_coordinates(chain) -> np.ndarray:
     return np.asarray(coords, dtype=float)
 
 
-def chain_to_pdb_text(chain) -> str:
-    class ChainSelect(Select):
-        def __init__(self, chain_id: str):
-            self.chain_id = chain_id
-
-        def accept_chain(self, chain):
-            return chain.id == self.chain_id
-
-        def accept_residue(self, residue):
-            return is_aa(residue, standard=False)
-
-    buffer = io.StringIO()
-    io_writer = PDBIO()
-    io_writer.set_structure(chain.get_parent().get_parent())
-    io_writer.save(buffer, select=ChainSelect(chain.id))
-    return buffer.getvalue()
-
-
 def pairwise_ca_distances(coords: np.ndarray) -> np.ndarray:
     if coords.shape[0] < 2:
         raise RuntimeError("At least two residues are required to build a histogram")
+    # Compute pairwise distances using broadcasting.
     diff = coords[:, None, :] - coords[None, :, :]
+    # Euclidean distance between C-alpha atoms
     distances = np.sqrt(np.sum(diff * diff, axis=-1))
+    # We only need the upper triangle of the distance matrix, as distances are symmetric and we don't include self-distances.
     return distances[np.triu_indices_from(distances, k=1)]
 
 
-def normalized_histogram(
-    distances: np.ndarray, bin_width: float, max_distance: float
-) -> tuple[np.ndarray, np.ndarray]:
-    upper_edge = np.ceil(max_distance / bin_width) * bin_width
-    edges = np.arange(0.0, upper_edge + bin_width, bin_width)
-    counts, edges = np.histogram(distances, bins=edges)
+def create_histogram(distances: np.ndarray, bins: np.ndarray) -> np.ndarray:
+    counts, _ = np.histogram(distances, bins=bins)
     total = counts.sum()
-    probabilities = counts / total if total else counts.astype(float)
-    return probabilities, edges
+    probabilities = counts / total
+    return probabilities
 
 
+# Compute the 1D Wasserstein distance between two histograms.
+# Wassertain distance is the minimum cost of transforming one distribution into another, where cost is defined as the amount of "mass" moved times the distance it is moved.
 def wasserstein_1(hist_a: np.ndarray, hist_b: np.ndarray, bin_width: float) -> float:
     return float(np.sum(np.abs(np.cumsum(hist_a) - np.cumsum(hist_b))) * bin_width)
 
 
+# Compute histogram overlap as the sum of minimum values in each bin. This gives a measure of how much the two histograms overlap, with 1 meaning complete overlap and 0 meaning no overlap.
 def histogram_overlap(hist_a: np.ndarray, hist_b: np.ndarray) -> float:
     return float(np.sum(np.minimum(hist_a, hist_b)))
 
@@ -154,36 +109,58 @@ def format_distance_summary(
     name_a: str,
     name_b: str,
     bins: np.ndarray,
-    hist_a: np.ndarray,
-    hist_b: np.ndarray,
     bin_width: float,
+    wasserstein_distance: float,
+    overlap_ratio: float,
 ) -> str:
-    w1 = wasserstein_1(hist_a, hist_b, bin_width)
-    overlap = histogram_overlap(hist_a, hist_b)
     return dedent(
         f"""
         <table class="metrics">
           <tr><th>Protein A</th><td>{name_a}</td></tr>
           <tr><th>Protein B</th><td>{name_b}</td></tr>
           <tr><th>Histogram bins</th><td>{len(bins) - 1} bins at {bin_width:.2f} Å</td></tr>
-          <tr><th>Wasserstein-1 distance</th><td>{w1:.3f} Å</td></tr>
-          <tr><th>Histogram overlap</th><td>{overlap:.3f}</td></tr>
+          <tr><th>Wasserstein-1 distance</th><td>{wasserstein_distance:.3f} Å</td></tr>
+          <tr><th>Histogram overlap</th><td>{overlap_ratio:.3f}</td></tr>
         </table>
         """
     ).strip()
 
 
+def figure_to_png(fig) -> bytes:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return buffer.getvalue()
+
+
 def make_histogram_figure(
+    name: str,
+    hist: np.ndarray,
+    bins: np.ndarray,
+    bin_width: float,
+    color: str,
+) -> bytes:
+    centers = bins[:-1] + bin_width / 2
+    fig, ax = plt.subplots(figsize=(8, 4.5), dpi=160)
+    ax.bar(centers, hist, width=bin_width * 0.92, color=color, alpha=0.9)
+    ax.set_title(f"{name} distance distribution")
+    ax.set_xlabel("Distance [Å]")
+    ax.set_ylabel("Probability")
+    ax.set_xlim(0, bins[-1])
+    ax.grid(axis="y", alpha=0.18)
+    fig.tight_layout()
+    return figure_to_png(fig)
+
+
+def make_histogram_overlay_figure(
     name_a: str,
     name_b: str,
-    distances_a: np.ndarray,
-    distances_b: np.ndarray,
+    hist_a: np.ndarray,
+    hist_b: np.ndarray,
+    bins: np.ndarray,
     bin_width: float,
 ) -> bytes:
-    max_distance = max(float(distances_a.max()), float(distances_b.max()))
-    hist_a, edges = normalized_histogram(distances_a, bin_width, max_distance)
-    hist_b, _ = normalized_histogram(distances_b, bin_width, max_distance)
-    centers = edges[:-1] + bin_width / 2
+    centers = bins[:-1] + bin_width / 2
 
     fig, ax = plt.subplots(figsize=(10, 5), dpi=160)
     ax.bar(
@@ -202,33 +179,14 @@ def make_histogram_figure(
         label=name_b,
         color="#f45b69",
     )
-    ax.set_title("C-alpha distance distribution")
-    ax.set_xlabel("Distance (Å)")
+    ax.set_title("C-alpha distance distributions")
+    ax.set_xlabel("Distance [Å]")
     ax.set_ylabel("Probability")
-    ax.set_xlim(0, edges[-1])
+    ax.set_xlim(0, bins[-1])
     ax.legend(frameon=False)
     ax.grid(axis="y", alpha=0.18)
     fig.tight_layout()
-
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", bbox_inches="tight")
-    plt.close(fig)
-    return buffer.getvalue()
-
-
-def compare_histograms(
-    distances_a: np.ndarray, distances_b: np.ndarray, bin_width: float
-) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
-    max_distance = max(float(distances_a.max()), float(distances_b.max()))
-    hist_a, bins = normalized_histogram(distances_a, bin_width, max_distance)
-    hist_b, _ = normalized_histogram(distances_b, bin_width, max_distance)
-    return (
-        wasserstein_1(hist_a, hist_b, bin_width),
-        histogram_overlap(hist_a, hist_b),
-        hist_a,
-        hist_b,
-        bins,
-    )
+    return figure_to_png(fig)
 
 
 def make_viewer_html(pdb_text: str, title: str) -> str:
@@ -240,25 +198,31 @@ def make_viewer_html(pdb_text: str, title: str) -> str:
     return f"<div class='viewer-title'>{title}</div>{view._make_html()}"
 
 
-def build_report(
+def build_html_report(
     output_path: Path,
     protein_a: ProteinData,
     protein_b: ProteinData,
-    histogram_png: bytes,
+    bins: np.ndarray,
     bin_width: float,
+    wasserstein_distance: float,
+    overlap_ratio: float,
+    histogram_a_png: bytes,
+    histogram_b_png: bytes,
+    overlay_png: bytes,
 ) -> None:
-    distances_a = pairwise_ca_distances(protein_a.ca_coords)
-    distances_b = pairwise_ca_distances(protein_b.ca_coords)
-    _, _, hist_a, hist_b, bins = compare_histograms(distances_a, distances_b, bin_width)
+    name_a = protein_a.get_display_name()
+    name_b = protein_b.get_display_name()
     metrics_html = format_distance_summary(
-        f"{protein_a.pdb_id}:{protein_a.chain_id}",
-        f"{protein_b.pdb_id}:{protein_b.chain_id}",
+        name_a,
+        name_b,
         bins,
-        hist_a,
-        hist_b,
         bin_width,
+        wasserstein_distance,
+        overlap_ratio,
     )
-    image_b64 = base64.b64encode(histogram_png).decode("ascii")
+    histogram_a_b64 = base64.b64encode(histogram_a_png).decode("ascii")
+    histogram_b_b64 = base64.b64encode(histogram_b_png).decode("ascii")
+    overlay_b64 = base64.b64encode(overlay_png).decode("ascii")
 
     html = dedent(
         f"""
@@ -287,19 +251,29 @@ def build_report(
             <h1>Protein C-alpha distance comparison</h1>
             <p class="note">
               Histograms are built from all pairwise distances between C-alpha atoms in the selected chain.
-              The comparison uses the 1D Wasserstein distance on normalized histograms.
+              The report shows individual histograms first, then the overlay comparison.
             </p>
             {metrics_html}
           </div>
 
           <div class="grid two-col" style="margin-bottom: 20px;">
-            <div class="card">{make_viewer_html(protein_a.structure_text, f"{protein_a.pdb_id}:{protein_a.chain_id} ({protein_a.format_name}, {protein_a.residue_count} residues)")}</div>
-            <div class="card">{make_viewer_html(protein_b.structure_text, f"{protein_b.pdb_id}:{protein_b.chain_id} ({protein_b.format_name}, {protein_b.residue_count} residues)")}</div>
+            <div class="card">{make_viewer_html(protein_a.structure_text, f"{name_a} - ({protein_a.residue_count} residues)")}</div>
+            <div class="card">{make_viewer_html(protein_b.structure_text, f"{name_b} - ({protein_b.residue_count} residues)")}</div>
+          </div>
+
+          <div class="card" style="margin-bottom: 20px;">
+            <h2>Histogram - {name_a}</h2>
+            <img class="figure" src="data:image/png;base64,{histogram_a_b64}" alt="Histogram for {name_a}" />
+          </div>
+
+          <div class="card" style="margin-bottom: 20px;">
+            <h2>Histogram - {name_b}</h2>
+            <img class="figure" src="data:image/png;base64,{histogram_b_b64}" alt="Histogram for {name_b}" />
           </div>
 
           <div class="card">
-            <h2>Histogram figure</h2>
-            <img class="figure" src="data:image/png;base64,{image_b64}" alt="C-alpha distance histograms" />
+            <h2>Overlay comparison</h2>
+            <img class="figure" src="data:image/png;base64,{overlay_b64}" alt="Overlay of C-alpha distance histograms" />
           </div>
         </body>
         </html>
@@ -309,74 +283,93 @@ def build_report(
     output_path.write_text(html, encoding="utf-8")
 
 
-def summarize_protein(
-    pdb_ref: str, preferred_chain_id: str | None = None
-) -> ProteinData:
-    pdb_id, chain_from_ref = parse_protein_ref(pdb_ref)
-    selected_chain_id = preferred_chain_id or chain_from_ref
-    text, format_name = fetch_structure_text(pdb_id)
-    structure = load_structure(pdb_id, text, format_name)
-    chain = choose_chain(structure, selected_chain_id)
+def get_protein_data(pdb_id: str) -> ProteinData:
+    pdb_id = pdb_id.strip().upper()
+    if len(pdb_id) != 4:
+        raise ValueError(f"Expected a 4-character PDB id, got {pdb_id!r}")
+    db_url = RCSB_PDB_URL.format(pdb_id=pdb_id.lower())
+    try:
+        with urlopen(db_url) as response:
+            text_data = response.read().decode("utf-8")
+    except (HTTPError, URLError):
+        raise RuntimeError(f"Could not download structure for {pdb_id}")
+
+    handle = io.StringIO(text_data)
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure(pdb_id, handle)
+    chain = choose_protein_chain(structure)
     coords = extract_ca_coordinates(chain)
-    chain_text = chain_to_pdb_text(chain)
     return ProteinData(
         pdb_id=pdb_id,
+        protein_name=structure.header['compound']['1']['molecule'] or structure.header.get("name", "Unknown"),
         chain_id=chain.id,
         residue_count=coords.shape[0],
         ca_coords=coords,
-        structure_text=chain_text,
-        format_name=format_name,
+        structure_text=text_data,
     )
-
-
-def build_output_path(output_dir: Path, protein_a: str, protein_b: str) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = f"{protein_a.replace(':', '_')}_vs_{protein_b.replace(':', '_')}"
-    return output_dir / f"{safe_name}.html"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare protein structures using C-alpha distance histograms."
     )
-    parser.add_argument(
-        "protein_a", help="First protein PDB id, optionally with chain id like 1MBO:A"
-    )
-    parser.add_argument(
-        "protein_b", help="Second protein PDB id, optionally with chain id like 1UBQ:B"
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="outputs",
-        help="Directory for the generated HTML report",
-    )
+    parser.add_argument("protein_a", help="First protein PDB id")
+    parser.add_argument("protein_b", help="Second protein PDB id")
     parser.add_argument(
         "--bin-width", type=float, default=1.0, help="Histogram bin width in Å"
     )
     args = parser.parse_args()
 
-    protein_a = summarize_protein(args.protein_a)
-    protein_b = summarize_protein(args.protein_b)
+    # get protein data by downloading PDB files and extracting C-alpha coordinates
+    protein_a = get_protein_data(args.protein_a)
+    protein_b = get_protein_data(args.protein_b)
 
+    # compute pairwise C-alpha distances and histograms for both proteins
     distances_a = pairwise_ca_distances(protein_a.ca_coords)
     distances_b = pairwise_ca_distances(protein_b.ca_coords)
-    histogram_png = make_histogram_figure(
-        f"{protein_a.pdb_id}:{protein_a.chain_id}",
-        f"{protein_b.pdb_id}:{protein_b.chain_id}",
-        distances_a,
-        distances_b,
+
+    # Get bins so that both histograms use the same bin edges, and the last bin includes the maximum distance observed in either protein.
+    max_distance = max(float(distances_a.max()), float(distances_b.max()))
+    max_bin = np.ceil(max_distance / args.bin_width) * args.bin_width
+    bins = np.arange(0.0, max_bin + args.bin_width, args.bin_width)
+
+    # create histograms data
+    hist_a = create_histogram(distances_a, bins)
+    hist_b = create_histogram(distances_b, bins)
+
+    # compute histogram comparison metrics
+    wasserstein_distance = wasserstein_1(hist_a, hist_b, args.bin_width)
+    overlap_ratio = histogram_overlap(hist_a, hist_b)
+
+    protein_a_display_name = protein_a.get_display_name()
+    protein_b_display_name = protein_b.get_display_name()
+
+    histogram_a_png = make_histogram_figure(
+        protein_a_display_name, hist_a, bins, args.bin_width, "#2f6df6"
+    )
+    histogram_b_png = make_histogram_figure(
+        protein_b_display_name, hist_b, bins, args.bin_width, "#f45b69"
+    )
+    overlay_png = make_histogram_overlay_figure(
+        protein_a_display_name,
+        protein_b_display_name,
+        hist_a,
+        hist_b,
+        bins,
         args.bin_width,
     )
 
-    output_path = build_output_path(
-        Path(args.output_dir), args.protein_a, args.protein_b
-    )
-    build_report(output_path, protein_a, protein_b, histogram_png, args.bin_width)
+    # make sure outputs dir exists
+    outputs_dir = Path("outputs")
+    outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    w1, overlap, _, _, _ = compare_histograms(distances_a, distances_b, args.bin_width)
-    print(f"Saved report to {output_path}")
-    print(f"Wasserstein-1 histogram distance: {w1:.3f} Å")
-    print(f"Histogram overlap: {overlap:.3f}")
+    output_filename = outputs_dir / f"{protein_a.pdb_id}_vs_{protein_b.pdb_id}.html"
+
+    build_html_report(output_filename, protein_a, protein_b, bins, args.bin_width, wasserstein_distance, overlap_ratio, histogram_a_png, histogram_b_png, overlay_png)
+
+    print(f"Saved HTML report to {output_filename}")
+    print(f"Wasserstein-1 histogram distance: {wasserstein_distance:.3f} Å")
+    print(f"Histogram overlap: {overlap_ratio:.3f}")
     print(
         f"Selected chains: {protein_a.pdb_id}:{protein_a.chain_id} and {protein_b.pdb_id}:{protein_b.chain_id}"
     )
