@@ -31,18 +31,6 @@ class ProteinData:
     def get_display_name(self) -> str:
         return f"{self.pdb_id}:{self.chain_id} ({self.protein_name})"
 
-
-def fetch_structure_text(pdb_id: str) -> tuple[str, str]:
-    for ext, format_name in (("pdb", "PDB"), ("cif", "mmCIF")):
-        url = RCSB_PDB_URL.format(pdb_id=pdb_id.lower(), ext=ext)
-        try:
-            with urlopen(url) as response:
-                return response.read().decode("utf-8"), format_name
-        except (HTTPError, URLError):
-            continue
-    raise RuntimeError(f"Could not download structure for {pdb_id}")
-
-
 # Count number of C-alpha atoms in residues of a chain that are recognized as amino acids
 def count_ca_atoms(chain) -> int:
     return sum(
@@ -299,9 +287,15 @@ def get_protein_data(pdb_id: str) -> ProteinData:
     structure = parser.get_structure(pdb_id, handle)
     chain = choose_protein_chain(structure)
     coords = extract_ca_coordinates(chain)
+
+    protein_name = structure.header.get("name", "Unknown")
+    # If the structure has a compound description with a molecule name, use that as the protein name instead, as it is often more short and descriptive than the header name.
+    if 'compound' in structure.header and '1' in structure.header['compound'] and 'molecule' in structure.header['compound']['1']:
+        protein_name = structure.header['compound']['1']['molecule']
+
     return ProteinData(
         pdb_id=pdb_id,
-        protein_name=structure.header['compound']['1']['molecule'] or structure.header.get("name", "Unknown"),
+        protein_name=protein_name,
         chain_id=chain.id,
         residue_count=coords.shape[0],
         ca_coords=coords,
