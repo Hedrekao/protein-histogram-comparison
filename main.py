@@ -225,8 +225,8 @@ def build_html_report(
             h1, h2, h3 {{ margin-top: 0; }}
             .grid {{ display: grid; gap: 20px; }}
             .two-col {{ grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }}
-            .card {{ background: white; border-radius: 16px; padding: 18px; box-shadow: 0 10px 30px rgba(19, 30, 54, 0.08); }}
-            .viewer-title {{ font-weight: 700; margin-bottom: 10px; font-size: 1rem; }}
+            .card {{ background: white; border-radius: 16px; padding: 18px; box-shadow: 0 10px 30px rgba(19, 30, 54, 0.08); display: flex; flex-direction: column; align-items: center }}
+            .viewer-title {{ font-weight: 700; margin-bottom: 10px; font-size: 1rem; display: flex; justify-content: center }}
             .metrics {{ border-collapse: collapse; width: 100%; margin-top: 8px; }}
             .metrics th, .metrics td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid #e6eaf1; vertical-align: top; }}
             .metrics th {{ width: 200px; color: #4f5b76; font-weight: 600; }}
